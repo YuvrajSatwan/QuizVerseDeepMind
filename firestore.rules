@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Quiz documents - read by anyone, write by anyone (for guest users)
+    match /quizzes/{quizId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if request.auth != null;
+      
+      // Players subcollection - anyone can join and update their own data
+      match /players/{playerId} {
+        allow read: if true;
+        allow create: if true;
+        allow update: if true;
+        allow delete: if request.auth != null;
+      }
+
+      // Ratings subcollection - anonymous ratings allowed (create only)
+      match /ratings/{ratingId} {
+        allow read: if true; // Host summary needs to read ratings
+        allow create: if
+          request.resource.data.keys().hasOnly(['rating','feedback','createdAt']) &&
+          request.resource.data.rating is int &&
+          request.resource.data.rating >= 1 && request.resource.data.rating <= 5 &&
+          (
+            !('feedback' in request.resource.data) ||
+            (request.resource.data.feedback is string && request.resource.data.feedback.size() <= 1000)
+          ) &&
+          ('createdAt' in request.resource.data); // accept serverTimestamp transform or client timestamp
+        // Disallow updates/deletes to preserve anonymity and integrity
+        allow update, delete: if false;
+      }
+    }
+    
+    // Test collection for connection testing
+    match /test/{document} {
+      allow read, write: if true;
+    }
+  }
+}
