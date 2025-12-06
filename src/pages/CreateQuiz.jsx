@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
+import { getFunctions, httpsCallable } from 'firebase/functions'
 import { 
   Plus, 
   Trash2, 
@@ -35,7 +36,7 @@ import {
 import { useQuiz } from '../contexts/QuizContext'
 import { useToast } from '../contexts/ToastContext'
 import { useAuth } from '../contexts/AuthContext'
-import { testFirebaseConnection } from '../firebase/config'
+import app, { testFirebaseConnection } from '../firebase/config'
 import AuthenticationModal from '../components/AuthenticationModal'
 import { saveDraft as saveDraftRemote, updateDraft as updateDraftRemote, getDraft as getDraftRemote } from '../services/DraftsService'
 
@@ -44,7 +45,11 @@ const CreateQuiz = () => {
   const { createQuiz } = useQuiz()
   const { success, error } = useToast()
   const { currentUser } = useAuth()
-  
+
+  const functions = getFunctions(app, 'us-central1')
+
+  const [creationMode, setCreationMode] = useState('manual') // 'manual' | 'ai'
+
   const [formData, setFormData] = useState({
     title: '',
     description: '',
@@ -52,6 +57,28 @@ const CreateQuiz = () => {
     showAnswers: 'live',
     enableRating: false
   })
+
+  const [aiForm, setAiForm] = useState({
+    topic: '',
+    subject: '',
+    questionCount: 10,
+    difficulty: {
+      easy: 33,
+      medium: 33,
+      hard: 34
+    },
+    types: {
+      mcq: true,
+      tf: true,
+      short: false
+    },
+    contextText: ''
+  })
+
+  const [aiQuestions, setAiQuestions] = useState([])
+  const [aiDraftId, setAiDraftId] = useState(null)
+  const [aiGenerating, setAiGenerating] = useState(false)
+  const [aiError, setAiError] = useState(null)
   
   const [questions, setQuestions] = useState([
     {
@@ -275,6 +302,235 @@ const CreateQuiz = () => {
   const handleDragEnd = () => {
     setDraggedItem(null)
     setDragOverIndex(null)
+  }
+
+  const getSelectedAiTypes = () => {
+    const types = []
+    if (aiForm.types.mcq) types.push('MCQ')
+    if (aiForm.types.tf) types.push('TF')
+    if (aiForm.types.short) types.push('short')
+    return types.length ? types : ['MCQ']
+  }
+
+  const handleAiGenerate = async () => {
+    if (!aiForm.topic.trim()) {
+      error('Please enter a topic for AI-generated quiz')
+      return
+    }
+
+    const payload = {
+      subject: aiForm.subject || null,
+      topic: aiForm.topic,
+      difficulty: {
+        easy: Number(aiForm.difficulty.easy) || 0,
+        medium: Number(aiForm.difficulty.medium) || 0,
+        hard: Number(aiForm.difficulty.hard) || 0
+      },
+      count: Number(aiForm.questionCount) || 5,
+      types: getSelectedAiTypes(),
+      contextText: aiForm.contextText || null
+    }
+
+    try {
+      setAiGenerating(true)
+      setAiError(null)
+
+      const callable = httpsCallable(functions, 'aiGenerateQuiz')
+      const res = await callable(payload)
+      const data = res.data || {}
+
+      if (!data.ok) {
+        throw new Error(data.error || 'AI generation failed')
+      }
+
+      const receivedQuestions = Array.isArray(data.questions) ? data.questions : []
+      if (!receivedQuestions.length) {
+        throw new Error('AI did not return any questions')
+      }
+
+      const normalized = receivedQuestions.map((q, index) => ({
+        qid: q.qid || `q_${index + 1}`,
+        text: q.text || '',
+        type: q.type || 'MCQ',
+        options: Array.isArray(q.options) ? q.options : [],
+        correctIndex: typeof q.correctIndex === 'number' ? q.correctIndex : 0,
+        correctAnswer: q.correctAnswer || '',
+        explanation: q.explanation || '',
+        difficulty: q.difficulty || 'medium',
+        conceptTags: Array.isArray(q.conceptTags) ? q.conceptTags : [],
+        modelMeta: q.modelMeta || { provider: data.provider || 'unknown' }
+      }))
+
+      setAiDraftId(data.draftId || null)
+      setAiQuestions(normalized)
+      success(`Generated ${normalized.length} questions with AI. You can edit them before saving.`)
+    } catch (e) {
+      console.error('AI generate failed', e)
+      const message = e.message || 'Failed to generate quiz with AI'
+      setAiError(message)
+      error(message)
+    } finally {
+      setAiGenerating(false)
+    }
+  }
+
+  const updateAiQuestion = (qid, field, value) => {
+    setAiQuestions(prev => prev.map(q => 
+      q.qid === qid ? { ...q, [field]: value } : q
+    ))
+  }
+
+  const updateAiOption = (qid, optionIndex, value) => {
+    setAiQuestions(prev => prev.map(q => {
+      if (q.qid !== qid) return q
+      const options = Array.isArray(q.options) ? [...q.options] : []
+      options[optionIndex] = value
+      return { ...q, options }
+    }))
+  }
+
+  const handleAiSaveQuiz = async () => {
+    if (!formData.title.trim()) {
+      error('Please enter a quiz title')
+      return
+    }
+
+    if (!aiQuestions.length) {
+      error('Please generate some AI questions first')
+      return
+    }
+
+    if (!currentUser || currentUser.isGuest) {
+      error('Only signed-in teachers can save AI-generated quizzes.')
+      setShowAuthModal(true)
+      return
+    }
+
+    if (aiQuestions.some(q => !q.text || !q.text.trim())) {
+      error('Please review AI questions and ensure each has text')
+      return
+    }
+
+    // Basic MCQ validation for AI questions
+    for (const q of aiQuestions) {
+      if (q.type === 'MCQ') {
+        const options = Array.isArray(q.options) ? q.options : []
+        if (options.length < 2 || options.some(opt => !String(opt || '').trim())) {
+          error('Each AI multiple-choice question must have at least two non-empty options')
+          return
+        }
+      }
+    }
+
+    const questionTime = Number(formData.questionTime)
+    if (!formData.questionTime || formData.questionTime === '' || isNaN(questionTime)) {
+      error('Please enter a valid timer value for questions.')
+      return
+    }
+    if (questionTime < 5) {
+      error(`Question timer must be at least 5 seconds. Current value: ${questionTime} seconds. Please increase the timer.`)
+      return
+    }
+    if (questionTime > 300) {
+      error('Question timer cannot exceed 300 seconds (5 minutes). Please set a shorter timer.')
+      return
+    }
+
+    setIsSubmitting(true)
+
+    try {
+      const isConnected = await testFirebaseConnection()
+      if (!isConnected) {
+        error('Failed to connect to Firebase. Please check your internet connection.')
+        return
+      }
+
+      const hostId = currentUser.uid
+      const sanitizedQuestionTime = Number(formData.questionTime) || 30
+
+      const convertedQuestions = aiQuestions.map((q, index) => {
+        const base = {
+          id: Date.now() + index,
+          text: q.text || ''
+        }
+
+        if (q.type === 'MCQ') {
+          const options = Array.isArray(q.options) ? q.options.map(opt => opt || '') : []
+          let correctIndex = typeof q.correctIndex === 'number' ? q.correctIndex : 0
+          if (correctIndex < 0 || correctIndex >= options.length) correctIndex = 0
+          return {
+            ...base,
+            type: 'mcq',
+            options,
+            correctAnswer: correctIndex
+          }
+        }
+
+        if (q.type === 'TF') {
+          let correctIndex = 0
+          if (typeof q.correctIndex === 'number') {
+            correctIndex = q.correctIndex === 0 ? 0 : 1
+          } else if (typeof q.correctAnswer === 'string') {
+            const val = q.correctAnswer.toLowerCase()
+            correctIndex = (val === 'false' || val === 'f' || val === '0' || val === 'no') ? 1 : 0
+          }
+          return {
+            ...base,
+            type: 'truefalse',
+            options: [],
+            correctAnswer: correctIndex
+          }
+        }
+
+        // Default to short answer
+        return {
+          ...base,
+          type: 'word',
+          options: [],
+          correctAnswer: q.correctAnswer || ''
+        }
+      })
+
+      setQuestions(convertedQuestions)
+
+      const quizData = {
+        title: formData.title,
+        description: formData.description,
+        showAnswers: formData.showAnswers,
+        enableRating: formData.enableRating,
+        questionTime: sanitizedQuestionTime,
+        questions: convertedQuestions.map(q => ({
+          text: q.text,
+          type: q.type,
+          options: q.type === 'mcq' ? q.options : [],
+          correctAnswer: q.correctAnswer
+        })),
+        createdAt: new Date().toISOString(),
+        createdBy: hostId,
+        status: 'waiting',
+        currentQuestion: 0,
+        showResults: false,
+        showLeaderboard: false
+      }
+
+      const quizId = await createQuiz(quizData)
+
+      localStorage.setItem('userId', hostId)
+      const code = quizId.slice(-6).toUpperCase()
+      localStorage.setItem('isQuizHost', quizId)
+      setQuizCode(code)
+
+      localStorage.removeItem('quizDraft')
+      setHasUnsavedChanges(false)
+      setAutoSaveStatus('saved')
+
+      success('AI-generated quiz created successfully!')
+    } catch (err) {
+      error('Failed to create AI-generated quiz. Please try again.')
+      console.error(err)
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   const handleSubmit = async (e) => {
@@ -934,7 +1190,10 @@ const CreateQuiz = () => {
 
   // Calculate progress
   const totalSteps = 3
-  const currentStep = formData.title ? (questions[0]?.text ? 3 : 2) : 1
+  const hasQuestions = creationMode === 'ai'
+    ? aiQuestions.length > 0
+    : !!questions[0]?.text
+  const currentStep = formData.title ? (hasQuestions ? 3 : 2) : 1
   const progress = (currentStep / totalSteps) * 100
 
   return (
@@ -989,6 +1248,36 @@ const CreateQuiz = () => {
             <p className="hidden sm:block text-sm lg:text-base text-gray-600 max-w-md mx-auto leading-snug px-3 sm:px-4 mt-1">
               Build engaging quizzes with our intuitive creator. Add questions, customize settings, and share with your audience in minutes.
             </p>
+
+            {/* Mode Toggle: AI vs Manual */}
+            <div className="mt-4 flex justify-center">
+              <div className="inline-flex items-center bg-white rounded-full border border-gray-200 shadow-sm p-1">
+                <button
+                  type="button"
+                  onClick={() => setCreationMode('ai')}
+                  className={`px-4 sm:px-6 py-1.5 text-xs sm:text-sm rounded-full flex items-center gap-2 transition-colors ${
+                    creationMode === 'ai'
+                      ? 'bg-gradient-to-r from-purple-500 to-primary-500 text-white shadow'
+                      : 'text-gray-600 hover:text-primary-600'
+                  }`}
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>AI Create Quiz</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreationMode('manual')}
+                  className={`ml-1 px-4 sm:px-6 py-1.5 text-xs sm:text-sm rounded-full flex items-center gap-2 transition-colors ${
+                    creationMode === 'manual'
+                      ? 'bg-gray-900 text-white shadow'
+                      : 'text-gray-600 hover:text-primary-600'
+                  }`}
+                >
+                  <FileText className="w-4 h-4" />
+                  <span>Manual Create</span>
+                </button>
+              </div>
+            </div>
           </div>
         </motion.div>
 
@@ -1154,349 +1443,714 @@ const CreateQuiz = () => {
                     </div>
                     <div>
                       <h2 className="text-lg sm:text-xl font-bold text-white">
-                        Questions ({questions.length})
+                        {creationMode === 'ai'
+                          ? `AI Questions (${aiQuestions.length || aiForm.questionCount || 0})`
+                          : `Questions (${questions.length})`}
                       </h2>
-                      <p className="text-purple-100 text-xs sm:text-sm">Add engaging questions to your quiz</p>
+                      <p className="text-purple-100 text-xs sm:text-sm">
+                        {creationMode === 'ai'
+                          ? 'Let AI draft questions, then review and edit before saving'
+                          : 'Add engaging questions to your quiz'}
+                      </p>
                     </div>
                   </div>
                 </div>
                 
                 <div className="p-4 sm:p-6 lg:p-8">
 
-                  {questions.length === 0 ? (
-                    <div className="text-center py-12">
-                      <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                        <HelpCircle className="w-10 h-10 text-gray-400" />
-                      </div>
-                      <h3 className="text-lg font-semibold text-gray-700 mb-2">No questions yet</h3>
-                      <p className="text-gray-500 mb-6">Click "Add Question" to get started</p>
-                      <button
-                        type="button"
-                        onClick={addQuestion}
-                        className="inline-flex items-center space-x-2 bg-primary-600 hover:bg-primary-700 text-white px-6 py-3 rounded-2xl transition-all duration-200"
-                      >
-                        <Plus className="w-5 h-5" />
-                        <span>Add Your First Question</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="space-y-6">
-                      {/* Drag & Drop Hint */}
-                      {questions.length > 1 && (
-                        <motion.div
-                          initial={{ opacity: 0, y: -10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          className="flex items-center space-x-2 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-4 py-3"
-                        >
-                          <GripVertical className="w-4 h-4 text-blue-500" />
-                          <span>💡 Drag questions by the grip handle to reorder them</span>
-                        </motion.div>
-                      )}
-                      
-                      <AnimatePresence>
-                        {questions.map((question, index) => (
-                          <motion.div
-                            key={question.id}
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -20, scale: 0.95 }}
-                            draggable
-                            onDragStart={(e) => handleDragStart(e, index)}
-                            onDragOver={(e) => handleDragOver(e, index)}
-                            onDragLeave={handleDragLeave}
-                            onDrop={(e) => handleDrop(e, index)}
-                            onDragEnd={handleDragEnd}
-                            className={`bg-white rounded-2xl border-2 overflow-hidden group transition-all duration-300 cursor-move ${
-                              draggedItem === index 
-                                ? 'border-primary-400 shadow-lg scale-[1.02] opacity-95'
-                                : dragOverIndex === index 
-                                ? 'border-primary-300 shadow-md bg-primary-50'
-                                : 'border-gray-200 hover:shadow-lg hover:border-primary-200'
-                            }`}
+                  {creationMode === 'manual' && (
+                    <>
+                      {questions.length === 0 ? (
+                        <div className="text-center py-12">
+                          <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <HelpCircle className="w-10 h-10 text-gray-400" />
+                          </div>
+                          <h3 className="text-lg font-semibold text-gray-700 mb-2">No questions yet</h3>
+                          <p className="text-gray-500 mb-6">Click "Add Question" to get started</p>
+                          <button
+                            type="button"
+                            onClick={addQuestion}
+                            className="inline-flex items-center space-x-2 bg-primary-600 hover:bg-primary-700 text-white px-6 py-3 rounded-2xl transition-all duration-200"
                           >
-                            {/* Question Header */}
-                            <div className="bg-white px-6 py-4 border-b border-gray-200">
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center space-x-3">
-                                  <div className="w-8 h-8 bg-gradient-to-r from-primary-500 to-primary-600 rounded-lg flex items-center justify-center">
-                                    <span className="text-white font-bold text-sm">{index + 1}</span>
-                                  </div>
-                                  <div>
-                                    <h3 className="font-semibold text-gray-900">Question {index + 1}</h3>
-                                    <p className="text-xs text-gray-500 capitalize">{question.type === 'mcq' ? 'Multiple Choice' : question.type === 'truefalse' ? 'True/False' : 'Word Answer'}</p>
+                            <Plus className="w-5 h-5" />
+                            <span>Add Your First Question</span>
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-6">
+                          {/* Drag & Drop Hint */}
+                          {questions.length > 1 && (
+                            <motion.div
+                              initial={{ opacity: 0, y: -10 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              className="flex items-center space-x-2 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-4 py-3"
+                            >
+                              <GripVertical className="w-4 h-4 text-blue-500" />
+                              <span>💡 Drag questions by the grip handle to reorder them</span>
+                            </motion.div>
+                          )}
+                          
+                          <AnimatePresence>
+                            {questions.map((question, index) => (
+                              <motion.div
+                                key={question.id}
+                                initial={{ opacity: 0, y: 20 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -20, scale: 0.95 }}
+                                draggable
+                                onDragStart={(e) => handleDragStart(e, index)}
+                                onDragOver={(e) => handleDragOver(e, index)}
+                                onDragLeave={handleDragLeave}
+                                onDrop={(e) => handleDrop(e, index)}
+                                onDragEnd={handleDragEnd}
+                                className={`bg-white rounded-2xl border-2 overflow-hidden group transition-all duration-300 cursor-move ${
+                                  draggedItem === index 
+                                    ? 'border-primary-400 shadow-lg scale-[1.02] opacity-95'
+                                    : dragOverIndex === index 
+                                    ? 'border-primary-300 shadow-md bg-primary-50'
+                                    : 'border-gray-200 hover:shadow-lg hover:border-primary-200'
+                                }`}
+                              >
+                                {/* Question Header */}
+                                <div className="bg-white px-6 py-4 border-b border-gray-200">
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex items-center space-x-3">
+                                      <div className="w-8 h-8 bg-gradient-to-r from-primary-500 to-primary-600 rounded-lg flex items-center justify-center">
+                                        <span className="text-white font-bold text-sm">{index + 1}</span>
+                                      </div>
+                                      <div>
+                                        <h3 className="font-semibold text-gray-900">Question {index + 1}</h3>
+                                        <p className="text-xs text-gray-500 capitalize">{question.type === 'mcq' ? 'Multiple Choice' : question.type === 'truefalse' ? 'True/False' : 'Word Answer'}</p>
+                                      </div>
+                                    </div>
+                                    
+                                    <div className="flex items-center space-x-2">
+                                      <button
+                                        type="button"
+                                        className={`p-2 rounded-lg transition-all duration-200 ${
+                                          draggedItem === index 
+                                            ? 'text-primary-600 bg-primary-100'
+                                            : 'text-gray-400 hover:text-primary-600 hover:bg-primary-50'
+                                        }`}
+                                        title="Drag to reorder questions"
+                                      >
+                                        <GripVertical className="w-4 h-4" />
+                                      </button>
+                                      
+                                      {questions.length > 1 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => removeQuestion(question.id)}
+                                          className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors duration-200 group"
+                                          title="Delete question"
+                                        >
+                                          <Trash2 className="w-4 h-4" />
+                                        </button>
+                                      )}
+                                    </div>
                                   </div>
                                 </div>
-                                
-                                <div className="flex items-center space-x-2">
-                                  <button
-                                    type="button"
-                                    className={`p-2 rounded-lg transition-all duration-200 ${
-                                      draggedItem === index 
-                                        ? 'text-primary-600 bg-primary-100'
-                                        : 'text-gray-400 hover:text-primary-600 hover:bg-primary-50'
-                                    }`}
-                                    title="Drag to reorder questions"
-                                  >
-                                    <GripVertical className="w-4 h-4" />
-                                  </button>
-                                  
-                                  {questions.length > 1 && (
-                                    <button
-                                      type="button"
-                                      onClick={() => removeQuestion(question.id)}
-                                      className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors duration-200 group"
-                                      title="Delete question"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
+
+                                {/* Question Content */}
+                                <div className="p-6 space-y-6">
+                                  {/* Question Text */}
+                                  <div>
+                                    <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-3">
+                                      <HelpCircle className="w-4 h-4 text-primary-500" />
+                                      <span>Question Text *</span>
+                                    </label>
+                                    <textarea
+                                      value={question.text}
+                                      onChange={(e) => updateQuestion(question.id, 'text', e.target.value)}
+                                      className="w-full px-4 py-4 border-2 border-gray-200 rounded-2xl focus:border-primary-500 focus:ring-4 focus:ring-primary-200 transition-all duration-200 placeholder-gray-400 resize-none text-lg"
+                                      rows="2"
+                                      placeholder="Ask a clear, engaging question..."
+                                      required
+                                    />
+                                    <div className="mt-2 flex justify-between items-center">
+                                      <p className="text-xs text-gray-500">Make it clear and concise</p>
+                                      <span className={`text-xs font-medium ${
+                                        question.text.length > 150 ? 'text-red-500' : 'text-gray-400'
+                                      }`}>
+                                        {question.text.length}/150
+                                      </span>
+                                    </div>
+                                  </div>
+
+                                  {/* Question Type */}
+                                  <div>
+                                    <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-3">
+                                      <Settings className="w-4 h-4 text-primary-500" />
+                                      <span>Question Type</span>
+                                    </label>
+                                    <div className="grid grid-cols-3 gap-3">
+                                      <button
+                                        type="button"
+                                        onClick={() => updateQuestion(question.id, 'type', 'mcq')}
+                                        className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
+                                          question.type === 'mcq'
+                                            ? 'border-primary-500 bg-primary-50 text-primary-700'
+                                            : 'border-gray-200 hover:border-gray-300 text-gray-600'
+                                        }`}
+                                      >
+                                        <Target className="w-5 h-5 mx-auto mb-2" />
+                                        <div className="text-sm font-medium">Multiple Choice</div>
+                                        <div className="text-xs text-gray-500">2-6 options</div>
+                                      </button>
+                                      
+                                      <button
+                                        type="button"
+                                        onClick={() => updateQuestion(question.id, 'type', 'truefalse')}
+                                        className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
+                                          question.type === 'truefalse'
+                                            ? 'border-primary-500 bg-primary-50 text-primary-700'
+                                            : 'border-gray-200 hover:border-gray-300 text-gray-600'
+                                        }`}
+                                      >
+                                        <CheckCircle className="w-5 h-5 mx-auto mb-2" />
+                                        <div className="text-sm font-medium">True/False</div>
+                                        <div className="text-xs text-gray-500">Yes or No</div>
+                                      </button>
+                                      
+                                      <button
+                                        type="button"
+                                        onClick={() => updateQuestion(question.id, 'type', 'word')}
+                                        className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
+                                          question.type === 'word'
+                                            ? 'border-primary-500 bg-primary-50 text-primary-700'
+                                            : 'border-gray-200 hover:border-gray-300 text-gray-600'
+                                        }`}
+                                      >
+                                        <FileText className="w-5 h-5 mx-auto mb-2" />
+                                        <div className="text-sm font-medium">Word Answer</div>
+                                        <div className="text-xs text-gray-500">Single word</div>
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Question Options */}
+                                  {question.type === 'mcq' && (
+                                    <div>
+                                      <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
+                                        <Target className="w-4 h-4 text-primary-500" />
+                                        <span>Answer Options *</span>
+                                      </label>
+                                      <div className="space-y-3">
+                                        {question.options.map((option, optionIndex) => (
+                                          <div key={optionIndex} className="flex items-center space-x-3 group">
+                                            <div className="relative flex items-center">
+                                              <input
+                                                type="radio"
+                                                name={`correct-${question.id}`}
+                                                checked={question.correctAnswer === optionIndex}
+                                                onChange={() => updateQuestion(question.id, 'correctAnswer', optionIndex)}
+                                                className="w-5 h-5 text-primary-600 border-2 border-gray-300 focus:ring-primary-500 focus:ring-2"
+                                                required
+                                              />
+                                              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                                {question.correctAnswer === optionIndex && (
+                                                  <motion.div
+                                                    initial={{ scale: 0 }}
+                                                    animate={{ scale: 1 }}
+                                                    className="w-2 h-2 bg-white rounded-full"
+                                                  />
+                                                )}
+                                              </div>
+                                            </div>
+                                            
+                                            <div className="flex items-center space-x-2 flex-1">
+                                              <span className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold ${
+                                                question.correctAnswer === optionIndex
+                                                  ? 'bg-green-100 text-green-700'
+                                                  : 'bg-gray-100 text-gray-500'
+                                              }`}>
+                                                {String.fromCharCode(65 + optionIndex)}
+                                              </span>
+                                              
+                                              <input
+                                                type="text"
+                                                value={option}
+                                                onChange={(e) => updateOption(question.id, optionIndex, e.target.value)}
+                                                className={`flex-1 px-4 py-3 border-2 rounded-2xl transition-all duration-200 ${
+                                                  // Check if this option is a duplicate
+                                                  isDuplicateOption(question, optionIndex, option) && option.trim() !== ''
+                                                    ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-4 focus:ring-red-200 text-red-700'
+                                                    : question.correctAnswer === optionIndex
+                                                    ? 'border-green-300 bg-green-50 focus:border-green-500 focus:ring-4 focus:ring-green-200'
+                                                    : 'border-gray-200 focus:border-primary-500 focus:ring-4 focus:ring-primary-200'
+                                                }`}
+                                                placeholder={`Option ${optionIndex + 1}`}
+                                                required
+                                              />
+                                              
+                                              {/* Duplicate warning icon */}
+                                              {isDuplicateOption(question, optionIndex, option) && option.trim() !== '' && (
+                                                <motion.div
+                                                  initial={{ scale: 0, rotate: -180 }}
+                                                  animate={{ scale: 1, rotate: 0 }}
+                                                  className="flex items-center justify-center w-8 h-8 bg-red-100 border-2 border-red-300 rounded-full ml-2 text-red-600"
+                                                  title="Duplicate option detected"
+                                                >
+                                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                                                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                                                  </svg>
+                                                </motion.div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      
+                                    </div>
+                                  )}
+
+                                  {question.type === 'truefalse' && (
+                                    <div>
+                                      <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
+                                        <CheckCircle className="w-4 h-4 text-primary-500" />
+                                        <span>Correct Answer *</span>
+                                      </label>
+                                      <div className="grid grid-cols-2 gap-4">
+                                        <button
+                                          type="button"
+                                          onClick={() => updateQuestion(question.id, 'correctAnswer', 0)}
+                                          className={`p-6 rounded-2xl border-2 transition-all duration-200 text-center ${
+                                            question.correctAnswer === 0
+                                              ? 'border-green-500 bg-green-50 text-green-700'
+                                              : 'border-gray-200 hover:border-gray-300 text-gray-600'
+                                          }`}
+                                        >
+                                          <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 ${
+                                            question.correctAnswer === 0
+                                              ? 'bg-green-100'
+                                              : 'bg-gray-100'
+                                          }`}>
+                                            <Check className="w-6 h-6" />
+                                          </div>
+                                          <div className="text-lg font-bold">True</div>
+                                          <div className="text-sm text-gray-500">This statement is correct</div>
+                                        </button>
+                                        
+                                        <button
+                                          type="button"
+                                          onClick={() => updateQuestion(question.id, 'correctAnswer', 1)}
+                                          className={`p-6 rounded-2xl border-2 transition-all duration-200 text-center ${
+                                            question.correctAnswer === 1
+                                              ? 'border-red-500 bg-red-50 text-red-700'
+                                              : 'border-gray-200 hover:border-gray-300 text-gray-600'
+                                          }`}
+                                        >
+                                          <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 ${
+                                            question.correctAnswer === 1
+                                              ? 'bg-red-100'
+                                              : 'bg-gray-100'
+                                          }`}>
+                                            <X className="w-6 h-6" />
+                                          </div>
+                                          <div className="text-lg font-bold">False</div>
+                                          <div className="text-sm text-gray-500">This statement is incorrect</div>
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {question.type === 'word' && (
+                                    <div>
+                                      <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
+                                        <FileText className="w-4 h-4 text-primary-500" />
+                                        <span>Correct Answer *</span>
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={question.correctAnswer || ''}
+                                        onChange={(e) => updateQuestion(question.id, 'correctAnswer', e.target.value.trim())}
+                                        className="w-full px-4 py-4 border-2 border-green-300 bg-green-50 focus:border-green-500 focus:ring-4 focus:ring-green-200 rounded-2xl transition-all duration-200 placeholder-gray-400"
+                                        placeholder="e.g., 'Paris' or 'Democracy'"
+                                        required
+                                      />
+                                      <p className="text-xs text-gray-500 mt-2">
+                                        💡 Enter the exact word answer. Answers will be checked case-insensitively
+                                      </p>
+                                    </div>
                                   )}
                                 </div>
-                              </div>
-                            </div>
-
-                            {/* Question Content */}
-                            <div className="p-6 space-y-6">
-                              {/* Question Text */}
-                              <div>
-                                <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-3">
-                                  <HelpCircle className="w-4 h-4 text-primary-500" />
-                                  <span>Question Text *</span>
-                                </label>
-                                <textarea
-                                  value={question.text}
-                                  onChange={(e) => updateQuestion(question.id, 'text', e.target.value)}
-                                  className="w-full px-4 py-4 border-2 border-gray-200 rounded-2xl focus:border-primary-500 focus:ring-4 focus:ring-primary-200 transition-all duration-200 placeholder-gray-400 resize-none text-lg"
-                                  rows="2"
-                                  placeholder="Ask a clear, engaging question..."
-                                  required
-                                />
-                                <div className="mt-2 flex justify-between items-center">
-                                  <p className="text-xs text-gray-500">Make it clear and concise</p>
-                                  <span className={`text-xs font-medium ${
-                                    question.text.length > 150 ? 'text-red-500' : 'text-gray-400'
-                                  }`}>
-                                    {question.text.length}/150
-                                  </span>
-                                </div>
-                              </div>
-
-                              {/* Question Type */}
-                              <div>
-                                <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-3">
-                                  <Settings className="w-4 h-4 text-primary-500" />
-                                  <span>Question Type</span>
-                                </label>
-                                <div className="grid grid-cols-3 gap-3">
-                                  <button
-                                    type="button"
-                                    onClick={() => updateQuestion(question.id, 'type', 'mcq')}
-                                    className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
-                                      question.type === 'mcq'
-                                        ? 'border-primary-500 bg-primary-50 text-primary-700'
-                                        : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                                    }`}
-                                  >
-                                    <Target className="w-5 h-5 mx-auto mb-2" />
-                                    <div className="text-sm font-medium">Multiple Choice</div>
-                                    <div className="text-xs text-gray-500">2-6 options</div>
-                                  </button>
-                                  
-                                  <button
-                                    type="button"
-                                    onClick={() => updateQuestion(question.id, 'type', 'truefalse')}
-                                    className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
-                                      question.type === 'truefalse'
-                                        ? 'border-primary-500 bg-primary-50 text-primary-700'
-                                        : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                                    }`}
-                                  >
-                                    <CheckCircle className="w-5 h-5 mx-auto mb-2" />
-                                    <div className="text-sm font-medium">True/False</div>
-                                    <div className="text-xs text-gray-500">Yes or No</div>
-                                  </button>
-                                  
-                                  <button
-                                    type="button"
-                                    onClick={() => updateQuestion(question.id, 'type', 'word')}
-                                    className={`p-4 rounded-2xl border-2 transition-all duration-200 text-center ${
-                                      question.type === 'word'
-                                        ? 'border-primary-500 bg-primary-50 text-primary-700'
-                                        : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                                    }`}
-                                  >
-                                    <FileText className="w-5 h-5 mx-auto mb-2" />
-                                    <div className="text-sm font-medium">Word Answer</div>
-                                    <div className="text-xs text-gray-500">Single word</div>
-                                  </button>
-                                </div>
-                              </div>
-
-                              {/* Question Options */}
-                              {question.type === 'mcq' && (
-                                <div>
-                                  <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
-                                    <Target className="w-4 h-4 text-primary-500" />
-                                    <span>Answer Options *</span>
-                                  </label>
-                                  <div className="space-y-3">
-                                    {question.options.map((option, optionIndex) => (
-                                      <div key={optionIndex} className="flex items-center space-x-3 group">
-                                        <div className="relative flex items-center">
-                                          <input
-                                            type="radio"
-                                            name={`correct-${question.id}`}
-                                            checked={question.correctAnswer === optionIndex}
-                                            onChange={() => updateQuestion(question.id, 'correctAnswer', optionIndex)}
-                                            className="w-5 h-5 text-primary-600 border-2 border-gray-300 focus:ring-primary-500 focus:ring-2"
-                                            required
-                                          />
-                                          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                                            {question.correctAnswer === optionIndex && (
-                                              <motion.div
-                                                initial={{ scale: 0 }}
-                                                animate={{ scale: 1 }}
-                                                className="w-2 h-2 bg-white rounded-full"
-                                              />
-                                            )}
-                                          </div>
-                                        </div>
-                                        
-                                        <div className="flex items-center space-x-2 flex-1">
-                                          <span className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold ${
-                                            question.correctAnswer === optionIndex
-                                              ? 'bg-green-100 text-green-700'
-                                              : 'bg-gray-100 text-gray-500'
-                                          }`}>
-                                            {String.fromCharCode(65 + optionIndex)}
-                                          </span>
-                                          
-                                          <input
-                                            type="text"
-                                            value={option}
-                                            onChange={(e) => updateOption(question.id, optionIndex, e.target.value)}
-                                            className={`flex-1 px-4 py-3 border-2 rounded-2xl transition-all duration-200 ${
-                                              // Check if this option is a duplicate
-                                              isDuplicateOption(question, optionIndex, option) && option.trim() !== ''
-                                                ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-4 focus:ring-red-200 text-red-700'
-                                                : question.correctAnswer === optionIndex
-                                                ? 'border-green-300 bg-green-50 focus:border-green-500 focus:ring-4 focus:ring-green-200'
-                                                : 'border-gray-200 focus:border-primary-500 focus:ring-4 focus:ring-primary-200'
-                                            }`}
-                                            placeholder={`Option ${optionIndex + 1}`}
-                                            required
-                                          />
-                                          
-                                          {/* Duplicate warning icon */}
-                                          {isDuplicateOption(question, optionIndex, option) && option.trim() !== '' && (
-                                            <motion.div
-                                              initial={{ scale: 0, rotate: -180 }}
-                                              animate={{ scale: 1, rotate: 0 }}
-                                              className="flex items-center justify-center w-8 h-8 bg-red-100 border-2 border-red-300 rounded-full ml-2 text-red-600"
-                                              title="Duplicate option detected"
-                                            >
-                                              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                                                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-                                              </svg>
-                                            </motion.div>
-                                          )}
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                  
-                                </div>
-                              )}
-
-                              {question.type === 'truefalse' && (
-                                <div>
-                                  <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
-                                    <CheckCircle className="w-4 h-4 text-primary-500" />
-                                    <span>Correct Answer *</span>
-                                  </label>
-                                  <div className="grid grid-cols-2 gap-4">
-                                    <button
-                                      type="button"
-                                      onClick={() => updateQuestion(question.id, 'correctAnswer', 0)}
-                                      className={`p-6 rounded-2xl border-2 transition-all duration-200 text-center ${
-                                        question.correctAnswer === 0
-                                          ? 'border-green-500 bg-green-50 text-green-700'
-                                          : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                                      }`}
-                                    >
-                                      <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 ${
-                                        question.correctAnswer === 0
-                                          ? 'bg-green-100'
-                                          : 'bg-gray-100'
-                                      }`}>
-                                        <Check className="w-6 h-6" />
-                                      </div>
-                                      <div className="text-lg font-bold">True</div>
-                                      <div className="text-sm text-gray-500">This statement is correct</div>
-                                    </button>
-                                    
-                                    <button
-                                      type="button"
-                                      onClick={() => updateQuestion(question.id, 'correctAnswer', 1)}
-                                      className={`p-6 rounded-2xl border-2 transition-all duration-200 text-center ${
-                                        question.correctAnswer === 1
-                                          ? 'border-red-500 bg-red-50 text-red-700'
-                                          : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                                      }`}
-                                    >
-                                      <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 ${
-                                        question.correctAnswer === 1
-                                          ? 'bg-red-100'
-                                          : 'bg-gray-100'
-                                      }`}>
-                                        <X className="w-6 h-6" />
-                                      </div>
-                                      <div className="text-lg font-bold">False</div>
-                                      <div className="text-sm text-gray-500">This statement is incorrect</div>
-                                    </button>
-                                  </div>
-                                </div>
-                              )}
-
-                              {question.type === 'word' && (
-                                <div>
-                                  <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-4">
-                                    <FileText className="w-4 h-4 text-primary-500" />
-                                    <span>Correct Answer *</span>
-                                  </label>
-                                  <input
-                                    type="text"
-                                    value={question.correctAnswer || ''}
-                                    onChange={(e) => updateQuestion(question.id, 'correctAnswer', e.target.value.trim())}
-                                    className="w-full px-4 py-4 border-2 border-green-300 bg-green-50 focus:border-green-500 focus:ring-4 focus:ring-green-200 rounded-2xl transition-all duration-200 placeholder-gray-400"
-                                    placeholder="e.g., 'Paris' or 'Democracy'"
-                                    required
-                                  />
-                                  <p className="text-xs text-gray-500 mt-2">
-                                    💡 Enter the exact word answer. Answers will be checked case-insensitively
-                                  </p>
-                                </div>
-                              )}
-                            </div>
+                              </motion.div>
+                            ))}
+                          </AnimatePresence>
+                          
+                          {/* Add Question Button - Now at the bottom */}
+                          <motion.div
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: 0.2 }}
+                            className="flex justify-center pt-4"
+                          >
+                            <button
+                              type="button"
+                              onClick={addQuestion}
+                              className="flex items-center space-x-3 bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white px-8 py-4 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-lg font-medium text-lg"
+                            >
+                              <Plus className="w-5 h-5" />
+                              <span>Add Question</span>
+                            </button>
                           </motion.div>
-                        ))}
-                      </AnimatePresence>
-                      
-                      {/* Add Question Button - Now at the bottom */}
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.2 }}
-                        className="flex justify-center pt-4"
-                      >
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {creationMode === 'ai' && (
+                    <div className="space-y-6">
+                      {aiError && (
+                        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                          {aiError}
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
+                        <div>
+                          <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                            <Target className="w-4 h-4 text-primary-500" />
+                            <span>Topic *</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={aiForm.topic}
+                            onChange={(e) => setAiForm({ ...aiForm, topic: e.target.value })}
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-2xl focus:border-purple-500 focus:ring-4 focus:ring-purple-200 transition-all duration-200 placeholder-gray-400"
+                            placeholder="e.g., Photosynthesis, World War II, Fractions"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                            <BookOpen className="w-4 h-4 text-primary-500" />
+                            <span>Subject (optional)</span>
+                          </label>
+                          <select
+                            value={aiForm.subject}
+                            onChange={(e) => setAiForm({ ...aiForm, subject: e.target.value })}
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-2xl focus:border-purple-500 focus:ring-4 focus:ring-purple-200 transition-all duration-200 bg-white text-sm"
+                          >
+                            <option value="">Select subject</option>
+                            <option value="General">General Knowledge</option>
+                            <option value="Math">Math</option>
+                            <option value="Science">Science</option>
+                            <option value="History">History</option>
+                            <option value="Geography">Geography</option>
+                            <option value="Language">Language / English</option>
+                            <option value="Computer Science">Computer Science</option>
+                            <option value="Other">Other</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
+                        <div>
+                          <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                            <HelpCircle className="w-4 h-4 text-primary-500" />
+                            <span>Number of Questions</span>
+                          </label>
+                          <div className="flex flex-wrap gap-2 mb-2">
+                            {[5, 10, 15].map((n) => (
+                              <button
+                                key={n}
+                                type="button"
+                                onClick={() => setAiForm({ ...aiForm, questionCount: n })}
+                                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                                  aiForm.questionCount === n
+                                    ? 'bg-primary-600 text-white border-primary-600'
+                                    : 'border-gray-200 text-gray-600 hover:border-primary-400'
+                                }`}
+                              >
+                                {n}
+                              </button>
+                            ))}
+                          </div>
+                          <input
+                            type="number"
+                            min="1"
+                            max="50"
+                            value={aiForm.questionCount}
+                            onChange={(e) => setAiForm({ ...aiForm, questionCount: Number(e.target.value) || 1 })}
+                            className="w-full px-4 py-2.5 border-2 border-gray-200 rounded-2xl focus:border-purple-500 focus:ring-4 focus:ring-purple-200 text-sm"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                            <BarChart3 className="w-4 h-4 text-primary-500" />
+                            <span>Difficulty %</span>
+                          </label>
+                          <div className="grid grid-cols-3 gap-2 text-xs">
+                            <div>
+                              <span className="block text-gray-500 mb-1">Easy</span>
+                              <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                value={aiForm.difficulty.easy}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  difficulty: { ...aiForm.difficulty, easy: Number(e.target.value) || 0 }
+                                })}
+                                className="w-full px-2 py-1.5 border-2 border-gray-200 rounded-xl focus:border-purple-500 focus:ring-2 focus:ring-purple-200 text-xs"
+                              />
+                            </div>
+                            <div>
+                              <span className="block text-gray-500 mb-1">Medium</span>
+                              <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                value={aiForm.difficulty.medium}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  difficulty: { ...aiForm.difficulty, medium: Number(e.target.value) || 0 }
+                                })}
+                                className="w-full px-2 py-1.5 border-2 border-gray-200 rounded-xl focus:border-purple-500 focus:ring-2 focus:ring-purple-200 text-xs"
+                              />
+                            </div>
+                            <div>
+                              <span className="block text-gray-500 mb-1">Hard</span>
+                              <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                value={aiForm.difficulty.hard}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  difficulty: { ...aiForm.difficulty, hard: Number(e.target.value) || 0 }
+                                })}
+                                className="w-full px-2 py-1.5 border-2 border-gray-200 rounded-xl focus:border-purple-500 focus:ring-2 focus:ring-purple-200 text-xs"
+                              />
+                            </div>
+                          </div>
+                          <p className="mt-1 text-[11px] text-gray-400">
+                            Sum doesn&apos;t have to be exactly 100% – it will be treated as weights.
+                          </p>
+                        </div>
+
+                        <div>
+                          <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                            <Settings className="w-4 h-4 text-primary-500" />
+                            <span>Question Types</span>
+                          </label>
+                          <div className="space-y-2 text-sm">
+                            <label className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                checked={aiForm.types.mcq}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  types: { ...aiForm.types, mcq: e.target.checked }
+                                })}
+                                className="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                              />
+                              <span>Multiple Choice (MCQ)</span>
+                            </label>
+                            <label className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                checked={aiForm.types.tf}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  types: { ...aiForm.types, tf: e.target.checked }
+                                })}
+                                className="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                              />
+                              <span>True / False</span>
+                            </label>
+                            <label className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                checked={aiForm.types.short}
+                                onChange={(e) => setAiForm({
+                                  ...aiForm,
+                                  types: { ...aiForm.types, short: e.target.checked }
+                                })}
+                                className="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                              />
+                              <span>Short Answer</span>
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="flex items-center space-x-2 text-sm font-semibold text-gray-700 mb-2">
+                          <FileText className="w-4 h-4 text-primary-500" />
+                          <span>Reference Text (optional)</span>
+                        </label>
+                        <textarea
+                          value={aiForm.contextText}
+                          onChange={(e) => setAiForm({ ...aiForm, contextText: e.target.value })}
+                          rows="3"
+                          className="w-full px-4 py-3 border-2 border-gray-200 rounded-2xl focus:border-purple-500 focus:ring-4 focus:ring-purple-200 text-sm placeholder-gray-400 resize-none"
+                          placeholder="Paste syllabus notes, textbook extract, or any reference material to ground the questions."
+                        />
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+                        <p className="text-xs text-gray-500">
+                          {(!currentUser || currentUser.isGuest)
+                            ? 'Guests can generate with AI but must sign in to save the quiz.'
+                            : 'AI will draft questions – you can fully edit before saving.'}
+                        </p>
                         <button
                           type="button"
-                          onClick={addQuestion}
-                          className="flex items-center space-x-3 bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white px-8 py-4 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-lg font-medium text-lg"
+                          onClick={handleAiGenerate}
+                          disabled={aiGenerating || !aiForm.topic.trim()}
+                          className={`inline-flex items-center justify-center gap-2 px-6 py-3 rounded-2xl text-sm font-semibold shadow-md transition-all duration-300 ${
+                            aiGenerating || !aiForm.topic.trim()
+                              ? 'bg-gray-200 text-gray-500 cursor-not-allowed'
+                              : 'bg-gradient-to-r from-purple-500 to-primary-600 text-white hover:from-purple-600 hover:to-primary-700 hover:scale-105'
+                          }`}
                         >
-                          <Plus className="w-5 h-5" />
-                          <span>Add Question</span>
+                          {aiGenerating ? (
+                            <>
+                              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                              <span>Generating...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-4 h-4" />
+                              <span>Generate with AI</span>
+                            </>
+                          )}
                         </button>
-                      </motion.div>
+                      </div>
+
+                      {aiQuestions.length > 0 && (
+                        <div className="pt-2 border-t border-gray-100 space-y-4">
+                          <div className="flex items-center justify-between">
+                            <h3 className="text-sm font-semibold text-gray-800">
+                              AI-generated Questions ({aiQuestions.length})
+                            </h3>
+                            <span className="text-[11px] text-gray-500">Edit anything before saving.</span>
+                          </div>
+
+                          {aiQuestions.map((q, index) => (
+                            <div
+                              key={q.qid}
+                              className="rounded-2xl border border-gray-200 bg-gray-50 p-4 sm:p-5 space-y-3"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-xs font-semibold text-gray-500 mb-1">
+                                    Question {index + 1} · <span className="capitalize">{q.type === 'MCQ' ? 'Multiple Choice' : q.type === 'TF' ? 'True/False' : 'Short Answer'}</span>
+                                  </div>
+                                  <textarea
+                                    value={q.text}
+                                    onChange={(e) => updateAiQuestion(q.qid, 'text', e.target.value)}
+                                    rows="2"
+                                    className="w-full text-sm px-3 py-2 border-2 border-white rounded-xl bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-200"
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  className="px-3 py-1 text-[11px] rounded-full border border-gray-300 bg-white text-gray-700 hover:border-purple-400 hover:text-purple-600"
+                                >
+                                  Edit
+                                </button>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
+                                <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
+                                  <BarChart3 className="w-3 h-3 mr-1" />
+                                  {q.difficulty || 'medium'}
+                                </span>
+                                {Array.isArray(q.conceptTags) && q.conceptTags.slice(0, 4).map((tag, i) => (
+                                  <span key={i} className="inline-flex items-center px-2 py-0.5 rounded-full bg-gray-100 text-gray-700">
+                                    #{tag}
+                                  </span>
+                                ))}
+                              </div>
+
+                              {q.type === 'MCQ' && (
+                                <div className="mt-2 space-y-2">
+                                  {q.options.map((opt, optIndex) => (
+                                    <div key={optIndex} className="flex items-center gap-2">
+                                      <input
+                                        type="radio"
+                                        name={`ai-correct-${q.qid}`}
+                                        checked={q.correctIndex === optIndex}
+                                        onChange={() => updateAiQuestion(q.qid, 'correctIndex', optIndex)}
+                                        className="w-4 h-4 text-primary-600 border-gray-300"
+                                      />
+                                      <input
+                                        type="text"
+                                        value={opt}
+                                        onChange={(e) => updateAiOption(q.qid, optIndex, e.target.value)}
+                                        className="flex-1 px-3 py-1.5 text-sm border-2 border-white rounded-xl bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-200"
+                                      />
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {q.type === 'TF' && (
+                                <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                                  <button
+                                    type="button"
+                                    onClick={() => updateAiQuestion(q.qid, 'correctIndex', 0)}
+                                    className={`px-3 py-2 rounded-xl border text-center ${
+                                      q.correctIndex === 0
+                                        ? 'border-green-500 bg-green-50 text-green-700'
+                                        : 'border-gray-200 bg-white text-gray-700'
+                                    }`}
+                                  >
+                                    True
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateAiQuestion(q.qid, 'correctIndex', 1)}
+                                    className={`px-3 py-2 rounded-xl border text-center ${
+                                      q.correctIndex === 1
+                                        ? 'border-red-500 bg-red-50 text-red-700'
+                                        : 'border-gray-200 bg-white text-gray-700'
+                                    }`}
+                                  >
+                                    False
+                                  </button>
+                                </div>
+                              )}
+
+                              {q.type === 'short' && (
+                                <div className="mt-2">
+                                  <label className="block text-xs font-semibold text-gray-600 mb-1">Correct Answer</label>
+                                  <input
+                                    type="text"
+                                    value={q.correctAnswer || ''}
+                                    onChange={(e) => updateAiQuestion(q.qid, 'correctAnswer', e.target.value)}
+                                    className="w-full px-3 py-2 text-sm border-2 border-white rounded-xl bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-200"
+                                  />
+                                </div>
+                              )}
+
+                              <div className="mt-2">
+                                <label className="block text-xs font-semibold text-gray-600 mb-1">Explanation</label>
+                                <textarea
+                                  value={q.explanation || ''}
+                                  onChange={(e) => updateAiQuestion(q.qid, 'explanation', e.target.value)}
+                                  rows="2"
+                                  className="w-full px-3 py-2 text-sm border-2 border-white rounded-xl bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-200"
+                                />
+                              </div>
+
+                              <div className="mt-2">
+                                <label className="block text-xs font-semibold text-gray-600 mb-1">Concept Tags (comma separated)</label>
+                                <input
+                                  type="text"
+                                  value={Array.isArray(q.conceptTags) ? q.conceptTags.join(', ') : ''}
+                                  onChange={(e) => updateAiQuestion(q.qid, 'conceptTags', e.target.value.split(',').map(t => t.trim()).filter(Boolean))}
+                                  className="w-full px-3 py-2 text-sm border-2 border-white rounded-xl bg-white focus:border-purple-500 focus:ring-2 focus:ring-purple-200"
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1563,63 +2217,84 @@ const CreateQuiz = () => {
                 </div>
 
             {/* Actions: Save Draft and Create Quiz */}
-            <div className="w-full flex flex-col sm:flex-row flex-wrap items-center justify-center gap-2 sm:gap-3">
-              <button
-                type="button"
-                disabled={savingDraft}
-                onClick={async () => {
-                  try {
-                    setSavingDraft(true)
-                    const draftPayload = { formData, questions, timestamp: Date.now() }
-                    if (!currentUser || currentUser.isGuest) {
-                      // Save locally for guests
-                      localStorage.setItem('quizDraft', JSON.stringify(draftPayload))
-                      setLastSaved(new Date())
-                      setHasUnsavedChanges(false)
-                      success('Draft saved locally')
-                    } else {
-                      if (draftId) {
-                        await updateDraftRemote(currentUser.uid, draftId, draftPayload)
-                        success('Draft updated')
+            {creationMode === 'manual' ? (
+              <div className="w-full flex flex-col sm:flex-row flex-wrap items-center justify-center gap-2 sm:gap-3">
+                <button
+                  type="button"
+                  disabled={savingDraft}
+                  onClick={async () => {
+                    try {
+                      setSavingDraft(true)
+                      const draftPayload = { formData, questions, timestamp: Date.now() }
+                      if (!currentUser || currentUser.isGuest) {
+                        // Save locally for guests
+                        localStorage.setItem('quizDraft', JSON.stringify(draftPayload))
+                        setLastSaved(new Date())
+                        setHasUnsavedChanges(false)
+                        success('Draft saved locally')
                       } else {
-                        const id = await saveDraftRemote(currentUser.uid, draftPayload)
-                        setDraftId(id)
-                        success('Draft saved')
+                        if (draftId) {
+                          await updateDraftRemote(currentUser.uid, draftId, draftPayload)
+                          success('Draft updated')
+                        } else {
+                          const id = await saveDraftRemote(currentUser.uid, draftPayload)
+                          setDraftId(id)
+                          success('Draft saved')
+                        }
                       }
+                    } catch (e) {
+                      console.error(e)
+                      error('Failed to save draft')
+                    } finally {
+                      setSavingDraft(false)
                     }
-                  } catch (e) {
-                    console.error(e)
-                    error('Failed to save draft')
-                  } finally {
-                    setSavingDraft(false)
-                  }
-                }}
-                className="inline-flex items-center justify-center gap-2 px-6 py-3 sm:px-8 sm:py-4 text-base sm:text-lg rounded-2xl border-2 border-primary-500 text-primary-600 bg-white hover:bg-primary-50 hover:border-primary-600 hover:text-primary-700 shadow-sm transition-all duration-300"
-              >
-                <Save className="w-5 h-5" />
-                <span>{savingDraft ? 'Saving...' : 'Save Draft'}</span>
-              </button>
+                  }}
+                  className="inline-flex items-center justify-center gap-2 px-6 py-3 sm:px-8 sm:py-4 text-base sm:text-lg rounded-2xl border-2 border-primary-500 text-primary-600 bg-white hover:bg-primary-50 hover:border-primary-600 hover:text-primary-700 shadow-sm transition-all duration-300"
+                >
+                  <Save className="w-5 h-5" />
+                  <span>{savingDraft ? 'Saving...' : 'Save Draft'}</span>
+                </button>
 
-              {/* Divider removed for tighter spacing between actions */}
-
-              <button
-                type="submit"
-                disabled={isSubmitting || !formData.title || questions.some(q => !q.text.trim())}
-                className="inline-flex items-center justify-center gap-2 px-6 py-3 sm:px-8 sm:py-4 text-base sm:text-lg rounded-2xl bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white shadow-lg transition-transform duration-300 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-              >
-                {isSubmitting ? (
-                  <>
-                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    <span>Creating Your Quiz...</span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="w-5 h-5" />
-                    <span>Create Quiz</span>
-                  </>
-                )}
-              </button>
-            </div>
+                <button
+                  type="submit"
+                  disabled={isSubmitting || !formData.title || questions.some(q => !q.text.trim())}
+                  className="inline-flex items-center justify-center gap-2 px-6 py-3 sm:px-8 sm:py-4 text-base sm:text-lg rounded-2xl bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white shadow-lg transition-transform duration-300 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Creating Your Quiz...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-5 h-5" />
+                      <span>Create Quiz</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            ) : (
+              <div className="w-full flex flex-col sm:flex-row flex-wrap items-center justify-center gap-2 sm:gap-3">
+                <button
+                  type="button"
+                  onClick={handleAiSaveQuiz}
+                  disabled={isSubmitting || !formData.title || aiQuestions.length === 0}
+                  className="inline-flex items-center justify-center gap-2 px-6 py-3 sm:px-8 sm:py-4 text-base sm:text-lg rounded-2xl bg-gradient-to-r from-purple-500 to-primary-600 hover:from-purple-600 hover:to-primary-700 text-white shadow-lg transition-transform duration-300 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Saving AI Quiz...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-5 h-5" />
+                      <span>Save AI Quiz</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
               </motion.div>
             </motion.form>
           </div>
@@ -1707,7 +2382,11 @@ const CreateQuiz = () => {
                   <div className="space-y-3 text-sm">
                     <div className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-xl">
                       <span className="text-gray-600">Questions</span>
-                      <span className="font-semibold text-gray-900">{questions.length}</span>
+                      <span className="font-semibold text-gray-900">{
+                        creationMode === 'ai'
+                          ? (aiQuestions.length || aiForm.questionCount || questions.length)
+                          : questions.length
+                      }</span>
                     </div>
                     
                     <div className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-xl">
@@ -1717,7 +2396,15 @@ const CreateQuiz = () => {
                     
                     <div className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-xl">
                       <span className="text-gray-600">Total time</span>
-                      <span className="font-semibold text-gray-900">{Math.ceil((questions.length * (Number(formData.questionTime) || 30)) / 60)} min</span>
+                      <span className="font-semibold text-gray-900">{
+                        (() => {
+                          const perQ = Number(formData.questionTime) || 30
+                          const count = creationMode === 'ai'
+                            ? (aiQuestions.length || aiForm.questionCount || questions.length)
+                            : questions.length
+                          return Math.ceil((count * perQ) / 60)
+                        })()
+                      } min</span>
                     </div>
                   </div>
                 </div>

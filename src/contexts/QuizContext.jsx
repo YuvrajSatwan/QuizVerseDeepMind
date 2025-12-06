@@ -163,7 +163,7 @@ export function QuizProvider({ children }) {
     }
   }
 
-  const submitAnswer = async (quizId, playerId, questionIndex, answer, isCorrect = false, timeBonus = 0, submissionTime = Date.now()) => {
+  const submitAnswer = async (quizId, playerId, questionIndex, answer, isCorrect = false, timeBonus = 0, submissionTime = Date.now(), responseTimeMs = null) => {
     try {
       // Calculate score for this answer - FIXED: Ensure 0 points for wrong answers
       const baseScore = isCorrect ? 100 : 0
@@ -188,7 +188,9 @@ export function QuizProvider({ children }) {
         isCorrect,
         score: totalScore,
         answeredAt: new Date().toISOString(),
-        submissionTime: submissionTime // Store millisecond timestamp for precise sorting
+        submissionTime: submissionTime, // Store millisecond timestamp for precise sorting
+        // Approximate response time (client-estimated). Used for cheat detection signals.
+        ...(typeof responseTimeMs === 'number' && responseTimeMs >= 0 ? { responseTimeMs } : {})
       }
       
       // Calculate new total score

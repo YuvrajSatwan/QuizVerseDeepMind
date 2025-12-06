@@ -5,11 +5,214 @@ admin.initializeApp();
 
 const db = admin.firestore();
 
+// ---- Cheat / Bot Detection configuration ----
+// Response time thresholds (in milliseconds)
+const FAST_RESPONSE_THRESHOLD_MS = 800; // "too fast" individual answers
+const LOW_AVG_RESPONSE_THRESHOLD_MS = 1500; // suspiciously low average
+
+// Behavioral thresholds
+const FAST_ANSWER_MIN_COUNT = 3; // number of ultra-fast answers before it matters
+const HIGH_ACCURACY_THRESHOLD = 0.95; // 95%+ accuracy
+const COLLISION_WINDOW_MS = 2000; // identical answer window between players
+const COLLISION_MIN_COUNT = 3; // how many collisions before considered suspicious
+
+interface AnswerRecord {
+  answer?: any;
+  isCorrect?: boolean;
+  score?: number;
+  answeredAt?: string;
+  submissionTime?: number; // ms timestamp from client
+  responseTimeMs?: number; // ms between question shown and answer (client-estimated)
+}
+
+interface CheatStats {
+  totalAnswers: number;
+  avgResponseTimeMs: number;
+  fastAnswerCount: number;
+  identicalAnswerCollisions: number;
+  accuracy: number;
+}
+
+async function evaluateCheatRisk(quizId: string, playerId: string): Promise<void> {
+  try {
+    const playerRef = db.doc(`quizzes/${quizId}/players/${playerId}`);
+    const playerSnap = await playerRef.get();
+
+    if (!playerSnap.exists) {
+      console.log(`[cheatDetection] Player ${playerId} not found for quiz ${quizId}`);
+      return;
+    }
+
+    const playerData = playerSnap.data() || {};
+    const rawAnswers: unknown = playerData.answers;
+    const answers: AnswerRecord[] = Array.isArray(rawAnswers)
+      ? (rawAnswers.filter((a) => a && typeof a === "object") as AnswerRecord[])
+      : [];
+
+    const totalAnswers = answers.length;
+
+    // If no answers, store a neutral record and exit
+    if (totalAnswers === 0) {
+      await db.doc(`quizzes/${quizId}/ai/cheatFlags/${playerId}`).set(
+        {
+          playerId,
+          riskScore: 0,
+          reasons: [],
+          lastEvaluatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          stats: {
+            totalAnswers: 0,
+            avgResponseTimeMs: 0,
+            fastAnswerCount: 0,
+            identicalAnswerCollisions: 0,
+            accuracy: 0,
+          },
+        },
+        { merge: true },
+      );
+      return;
+    }
+
+    // --- Basic per-player stats ---
+    let fastAnswerCount = 0;
+    let correctCount = 0;
+    let totalResponseTime = 0;
+    let responseCount = 0;
+
+    for (const ans of answers) {
+      const rt = typeof ans.responseTimeMs === "number" ? ans.responseTimeMs : undefined;
+      if (typeof ans.isCorrect === "boolean" && ans.isCorrect) {
+        correctCount++;
+      }
+      if (rt !== undefined && rt >= 0) {
+        totalResponseTime += rt;
+        responseCount++;
+        if (rt < FAST_RESPONSE_THRESHOLD_MS) {
+          fastAnswerCount++;
+        }
+      }
+    }
+
+    const avgResponseTimeMs = responseCount > 0 ? totalResponseTime / responseCount : 0;
+    const accuracy = totalAnswers > 0 ? correctCount / totalAnswers : 0;
+
+    // --- Pattern similarity across players (identical answer collisions) ---
+    const playersSnapshot = await db
+      .collection(`quizzes/${quizId}/players`)
+      .get();
+
+    interface QuestionAnswerEntry {
+      playerId: string;
+      questionIndex: number;
+      answer: any;
+      submissionTime?: number;
+    }
+
+    const questionAnswers: QuestionAnswerEntry[] = [];
+
+    playersSnapshot.forEach((docSnap) => {
+      const data = docSnap.data() || {};
+      const playerAnswers: AnswerRecord[] = Array.isArray(data.answers)
+        ? (data.answers.filter((a: unknown) => a && typeof a === "object") as AnswerRecord[])
+        : [];
+
+      playerAnswers.forEach((ans, index) => {
+        if (ans.answer !== undefined) {
+          questionAnswers.push({
+            playerId: docSnap.id,
+            questionIndex: index,
+            answer: ans.answer,
+            submissionTime: typeof ans.submissionTime === "number" ? ans.submissionTime : undefined,
+          });
+        }
+      });
+    });
+
+    let identicalAnswerCollisions = 0;
+
+    // For simplicity, count for the current player how many of their answers collide
+    // with at least one other player on the same question, same answer, and within the time window.
+    const playerAnswersForCollision = questionAnswers.filter((qa) => qa.playerId === playerId);
+
+    for (const pa of playerAnswersForCollision) {
+      if (pa.submissionTime === undefined) continue;
+      const collisionsForThisAnswer = questionAnswers.some((other) => {
+        if (other.playerId === playerId) return false;
+        if (other.questionIndex !== pa.questionIndex) return false;
+        if (other.answer !== pa.answer) return false;
+        if (other.submissionTime === undefined) return false;
+        return (
+          Math.abs(other.submissionTime - pa.submissionTime) <= COLLISION_WINDOW_MS
+        );
+      });
+      if (collisionsForThisAnswer) {
+        identicalAnswerCollisions++;
+      }
+    }
+
+    const stats: CheatStats = {
+      totalAnswers,
+      avgResponseTimeMs,
+      fastAnswerCount,
+      identicalAnswerCollisions,
+      accuracy,
+    };
+
+    // --- Risk scoring ---
+    let riskScore = 0;
+    const reasons: string[] = [];
+
+    if (fastAnswerCount >= FAST_ANSWER_MIN_COUNT) {
+      riskScore += 0.3;
+      reasons.push("Too many ultra-fast answers");
+    }
+
+    if (
+      accuracy >= HIGH_ACCURACY_THRESHOLD &&
+      avgResponseTimeMs > 0 &&
+      avgResponseTimeMs <= LOW_AVG_RESPONSE_THRESHOLD_MS
+    ) {
+      riskScore += 0.5;
+      reasons.push("High accuracy with very low response time");
+    }
+
+    if (identicalAnswerCollisions >= COLLISION_MIN_COUNT) {
+      riskScore += 0.4;
+      reasons.push("Suspiciously similar answers to other players");
+    }
+
+    // Clamp between 0 and 1
+    riskScore = Math.min(1, Math.max(0, riskScore));
+
+    await db
+      .doc(`quizzes/${quizId}/ai/cheatFlags/${playerId}`)
+      .set(
+        {
+          playerId,
+          riskScore,
+          reasons,
+          lastEvaluatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          stats,
+        },
+        { merge: true },
+      );
+
+    console.log(
+      `[cheatDetection] Evaluated cheat risk for player ${playerId} in quiz ${quizId}: score=${riskScore.toFixed(2)}`,
+    );
+  } catch (err) {
+    console.error(
+      `[cheatDetection] Failed to evaluate cheat risk for player ${playerId} in quiz ${quizId}:`,
+      err,
+    );
+  }
+}
+
 // Cloud Function to calculate leaderboard
 export const calculateLeaderboard = functions.firestore
   .document("quizzes/{quizId}/players/{playerId}")
   .onWrite(async (change, context) => {
     const quizId = context.params.quizId;
+    const playerId = context.params.playerId;
     
     try {
       // Get all players for this quiz
@@ -36,6 +239,11 @@ export const calculateLeaderboard = functions.firestore
       });
       
       console.log(`Leaderboard updated for quiz ${quizId}`);
+
+      // After updating leaderboard, evaluate cheat / bot risk for this player
+      if (change.after.exists) {
+        await evaluateCheatRisk(quizId, playerId);
+      }
     } catch (error) {
       console.error("Error updating leaderboard:", error);
     }

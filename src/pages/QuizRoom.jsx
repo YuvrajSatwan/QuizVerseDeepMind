@@ -456,11 +456,13 @@ const QuizRoom = () => {
       
       // Store submission timestamp for precise tiebreaking
       const submissionTime = Date.now()
+      // Approximate response time: how long the player took to answer the question
+      const responseTimeMs = Math.max(0, questionTimeMs - remainingTimeMs)
       
-      console.log(`✅ Answer submitted: ${selectedAnswer}, Correct: ${isCorrect}, Score: ${totalScore}`)
+      console.log(`✅ Answer submitted: ${selectedAnswer}, Correct: ${isCorrect}, Score: ${totalScore}, responseTimeMs=${responseTimeMs}`)
       
       // Submit answer to Firebase (non-blocking UI)
-      submitAnswerToContext(quizId, playerId, currentQuestionIndex, selectedAnswer, isCorrect, timeBonus, submissionTime)
+      submitAnswerToContext(quizId, playerId, currentQuestionIndex, selectedAnswer, isCorrect, timeBonus, submissionTime, responseTimeMs)
         .then(() => {
           // Refresh leaderboard after successful submission (background task)
           loadPlayers()

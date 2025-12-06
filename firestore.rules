@@ -16,6 +16,16 @@ service cloud.firestore {
         allow delete: if request.auth != null;
       }
 
+      // AI / cheat detection flags - host-only read, backend-only write
+      match /ai/cheatFlags/{playerId} {
+        // Only the authenticated quiz creator can read cheat flags for their quiz
+        allow read: if
+          request.auth != null &&
+          get(/databases/$(database)/documents/quizzes/$(quizId)).data.createdBy == request.auth.uid;
+        // All writes must go through Cloud Functions using the Admin SDK
+        allow write: if false;
+      }
+
       // Ratings subcollection - anonymous ratings allowed (create only)
       match /ratings/{ratingId} {
         allow read: if true; // Host summary needs to read ratings
